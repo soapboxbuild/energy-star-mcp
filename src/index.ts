@@ -7,361 +7,211 @@ import { z } from 'zod'
 const BASE_URL = 'https://portfoliomanager.energystar.gov/ws'
 const PORT = parseInt(process.env.PORT ?? '3000', 10)
 
-// ── EPA API helper ────────────────────────────────────────────────────────────
+// Central Soapbox ESPM account — stored as env vars, used for all data fetches.
+// Users share their properties with this account during connect_property.
+const CENTRAL_USERNAME = process.env.ESPM_USERNAME ?? ''
+const CENTRAL_PASSWORD = process.env.ESPM_PASSWORD ?? ''
+const CENTRAL_CREDS = Buffer.from(`${CENTRAL_USERNAME}:${CENTRAL_PASSWORD}`).toString('base64')
 
-async function epaFetch(
-  path: string,
-  credentials: string,
-  options: RequestInit = {}
-): Promise<Response> {
-  const url = `${BASE_URL}${path}`
-  const headers: Record<string, string> = {
-    Authorization: `Basic ${credentials}`,
-    Accept: 'application/json',
-    'Content-Type': 'application/json',
-    ...(options.headers as Record<string, string> | undefined),
-  }
-  return fetch(url, { ...options, headers })
+async function epaFetch(path: string, credentials: string, options: RequestInit = {}): Promise<Response> {
+  return fetch(`${BASE_URL}${path}`, {
+    ...options,
+    headers: {
+      Authorization: `Basic ${credentials}`,
+      Accept: 'application/json',
+      'Content-Type': 'application/json',
+      ...(options.headers as Record<string, string> | undefined),
+    },
+  })
 }
 
-async function epaGet(path: string, credentials: string): Promise<unknown> {
+async function epaGet(path: string, credentials = CENTRAL_CREDS): Promise<unknown> {
   const res = await epaFetch(path, credentials)
-  if (!res.ok) {
-    const text = await res.text()
-    throw new Error(`EPA API ${res.status} on GET ${path}: ${text}`)
-  }
+  if (!res.ok) throw new Error(`EPA ${res.status} GET ${path}: ${await res.text()}`)
   return res.json()
 }
 
-async function epaPost(
-  path: string,
-  credentials: string,
-  body: unknown
-): Promise<unknown> {
-  const res = await epaFetch(path, credentials, {
-    method: 'POST',
-    body: JSON.stringify(body),
-  })
-  if (!res.ok) {
-    const text = await res.text()
-    throw new Error(`EPA API ${res.status} on POST ${path}: ${text}`)
-  }
+async function epaPost(path: string, credentials = CENTRAL_CREDS, body: unknown): Promise<unknown> {
+  const res = await epaFetch(path, credentials, { method: 'POST', body: JSON.stringify(body) })
+  if (!res.ok) throw new Error(`EPA ${res.status} POST ${path}: ${await res.text()}`)
   return res.json()
 }
 
-// ── MCP server factory ────────────────────────────────────────────────────────
+function createServer(): McpServer {
+  const server = new McpServer({ name: 'energy-star-portfolio-manager', version: '0.2.0' })
 
-function createServer(credentials: string): McpServer {
-  const server = new McpServer({
-    name: 'energy-star-portfolio-manager',
-    version: '0.1.0',
-  })
-
-  // 1. list_properties
+  // ── One-time setup: user provides their own PM credentials to find properties
+  // and share them with the central Soapbox account. After this, only the
+  // property ID is needed — user credentials are never stored.
   server.tool(
-    'list_properties',
-    'List all properties in the Portfolio Manager account',
-    {},
-    async () => {
-      const data = (await epaGet('/property/list', credentials)) as {
-        links?: { link?: Array<{ '@_id': string; '@_hint': string }> }
-        response?: { links?: { link?: unknown[] } }
-      }
+    'connect_property',
+    'One-time setup: authenticate with user\'s PM credentials to list their properties, then share the selected property with the central Soapbox ESPM account. Returns propertyId to store as the connector identifier.',
+    {
+      userUsername: z.string().describe('User\'s Portfolio Manager username'),
+      userPassword: z.string().describe('User\'s Portfolio Manager password'),
+      propertyNameSearch: z.string().optional().describe('Search term to filter properties by name (optional — omit to list all)'),
+    },
+    async ({ userUsername, userPassword, propertyNameSearch }) => {
+      const userCreds = Buffer.from(`${userUsername}:${userPassword}`).toString('base64')
 
-      // PM returns a links object; each link has the property id + name
-      const links =
-        (data as { links?: { link?: unknown[] } })?.links?.link ?? []
-      const properties = (links as Array<Record<string, unknown>>).map((l) => ({
-        id: l['@_id'] ?? l.id,
-        name: l['@_hint'] ?? l.name,
+      // 1. List user's properties
+      const data = await epaGet('/property/list', userCreds) as { links?: { link?: unknown[] } }
+      const links = data?.links?.link ?? []
+      const properties = (Array.isArray(links) ? links : [links]) as Array<Record<string, unknown>>
+
+      const filtered = propertyNameSearch
+        ? properties.filter(p => String(p['@_hint'] ?? p.name ?? '').toLowerCase().includes(propertyNameSearch.toLowerCase()))
+        : properties
+
+      const propertyList = filtered.map(p => ({
+        id: String(p['@_id'] ?? p.id ?? ''),
+        name: String(p['@_hint'] ?? p.name ?? ''),
       }))
 
-      return {
-        content: [
-          {
-            type: 'text' as const,
-            text: JSON.stringify(properties, null, 2),
-          },
-        ],
-      }
-    }
-  )
-
-  // 2. get_property
-  server.tool(
-    'get_property',
-    'Get property details and current ENERGY STAR score',
-    { propertyId: z.string().describe('Portfolio Manager property ID') },
-    async ({ propertyId }) => {
-      const [details, metrics] = await Promise.all([
-        epaGet(`/property/${propertyId}`, credentials),
-        epaGet(`/property/${propertyId}/metrics`, credentials).catch(
-          () => null
-        ),
-      ])
-
-      const result = {
-        property: details,
-        metrics: metrics,
+      if (propertyList.length === 0) {
+        return { content: [{ type: 'text' as const, text: JSON.stringify({ error: 'No properties found', searched: propertyNameSearch }) }] }
       }
 
-      return {
-        content: [{ type: 'text' as const, text: JSON.stringify(result, null, 2) }],
-      }
-    }
-  )
-
-  // 3. get_metrics
-  server.tool(
-    'get_metrics',
-    'Get energy metrics for a property (ENERGY STAR score, EUI, GHG emissions)',
-    {
-      propertyId: z.string().describe('Portfolio Manager property ID'),
-      year: z
-        .number()
-        .optional()
-        .describe('Year for metrics (defaults to last year)'),
-    },
-    async ({ propertyId, year }) => {
-      const targetYear = year ?? new Date().getFullYear() - 1
-      const data = await epaGet(
-        `/property/${propertyId}/metrics?year=${targetYear}`,
-        credentials
-      )
-
-      // Normalise the PM response into a flat metrics object
-      const raw = data as Record<string, unknown>
-      const metrics =
-        raw?.metrics ??
-        raw?.propertyMetrics ??
-        raw?.response ??
-        raw
-
-      return {
-        content: [
-          {
-            type: 'text' as const,
-            text: JSON.stringify(
-              { year: targetYear, propertyId, metrics },
-              null,
-              2
-            ),
-          },
-        ],
-      }
-    }
-  )
-
-  // 4. get_meters
-  server.tool(
-    'get_meters',
-    'List all utility meters for a property',
-    { propertyId: z.string().describe('Portfolio Manager property ID') },
-    async ({ propertyId }) => {
-      const data = await epaGet(
-        `/property/${propertyId}/meter/list`,
-        credentials
-      )
-
-      const raw = data as Record<string, unknown>
-      const links = (raw?.links as Record<string, unknown>)?.link ?? []
-      const meters = (Array.isArray(links) ? links : [links]).map(
-        (l: Record<string, unknown>) => ({
-          id: l['@_id'] ?? l.id,
-          name: l['@_hint'] ?? l.name,
-          type: l['@_type'] ?? l.type,
-          unitOfMeasure: l['@_unitOfMeasure'] ?? l.unitOfMeasure,
-          inUse: l['@_inUse'] ?? l.inUse,
-        })
-      )
-
-      return {
-        content: [{ type: 'text' as const, text: JSON.stringify(meters, null, 2) }],
-      }
-    }
-  )
-
-  // 5. submit_meter_data
-  server.tool(
-    'submit_meter_data',
-    'Submit energy consumption data for a utility meter',
-    {
-      meterId: z.string().describe('Portfolio Manager meter ID'),
-      startDate: z.string().describe('Start date in YYYY-MM-DD format'),
-      endDate: z.string().describe('End date in YYYY-MM-DD format'),
-      usage: z.number().describe('Energy usage amount'),
-      cost: z.number().optional().describe('Cost in USD (optional)'),
-    },
-    async ({ meterId, startDate, endDate, usage, cost }) => {
-      const body: Record<string, unknown> = {
-        meterConsumption: {
-          startDate,
-          endDate,
-          usage,
-          ...(cost !== undefined ? { cost } : {}),
-          estimatedValue: false,
-        },
-      }
-
-      const result = await epaPost(
-        `/meter/${meterId}/consumption`,
-        credentials,
-        body
-      )
-
-      return {
-        content: [
-          {
-            type: 'text' as const,
-            text: JSON.stringify(
-              { success: true, meterId, startDate, endDate, usage, cost, result },
-              null,
-              2
-            ),
-          },
-        ],
-      }
-    }
-  )
-
-  // 6. get_national_median
-  server.tool(
-    'get_national_median',
-    'Get national median EUI for a property type (e.g. "Office", "Multifamily Housing", "Retail Store")',
-    {
-      propertyType: z
-        .string()
-        .describe('Property type name, e.g. "Office", "Multifamily Housing"'),
-    },
-    async ({ propertyType }) => {
-      // Fetch the full property use type list and filter client-side
-      const data = await epaGet('/property/propertyUse/list', credentials)
-
-      const raw = data as Record<string, unknown>
-      // PM wraps this in various shapes; try to extract the list
-      const types =
-        (raw?.propertyUses as Record<string, unknown>)?.propertyUse ??
-        (raw?.response as Record<string, unknown>)?.propertyUses ??
-        raw?.propertyUse ??
-        []
-
-      const list = (Array.isArray(types) ? types : [types]) as Array<
-        Record<string, unknown>
-      >
-
-      const match = list.find(
-        (t) =>
-          String(t.name ?? t['@_name'] ?? '').toLowerCase() ===
-          propertyType.toLowerCase()
-      )
-
-      if (!match) {
-        // Return available types to help the caller
-        const available = list.map(
-          (t) => t.name ?? t['@_name'] ?? JSON.stringify(t)
-        )
-        return {
-          content: [
-            {
-              type: 'text' as const,
-              text: JSON.stringify(
-                {
-                  error: `Property type "${propertyType}" not found`,
-                  available,
-                },
-                null,
-                2
-              ),
-            },
-          ],
+      // 2. Share the first matched property with the central Soapbox account
+      if (propertyList.length === 1 && CENTRAL_USERNAME) {
+        const propertyId = propertyList[0].id
+        try {
+          await epaPost(`/property/${propertyId}/share`, userCreds, {
+            accountUsername: CENTRAL_USERNAME,
+            level: 'READ_ONLY',
+          })
+        } catch {
+          // Sharing may fail if already shared — non-fatal
         }
       }
 
       return {
-        content: [
-          {
-            type: 'text' as const,
-            text: JSON.stringify(
-              {
-                propertyType: match.name ?? match['@_name'],
-                medianEUI: match.medianEUI ?? match.nationalMedianEUI,
-                units: match.units ?? 'kBtu/ft²',
-                raw: match,
-              },
-              null,
-              2
-            ),
-          },
-        ],
+        content: [{
+          type: 'text' as const,
+          text: JSON.stringify({
+            properties: propertyList,
+            instruction: propertyList.length > 1
+              ? 'Multiple properties found. Run connect_property again with propertyNameSearch to narrow to one, then call share_property with the chosen propertyId.'
+              : `Property connected. Store propertyId: ${propertyList[0].id}`,
+          }, null, 2),
+        }],
       }
+    }
+  )
+
+  server.tool(
+    'share_property',
+    'Share a specific PM property with the central Soapbox ESPM account (called after connect_property if multiple properties were found).',
+    {
+      userUsername: z.string(),
+      userPassword: z.string(),
+      propertyId: z.string().describe('PM property ID to share'),
+    },
+    async ({ userUsername, userPassword, propertyId }) => {
+      const userCreds = Buffer.from(`${userUsername}:${userPassword}`).toString('base64')
+      await epaPost(`/property/${propertyId}/share`, userCreds, {
+        accountUsername: CENTRAL_USERNAME,
+        level: 'READ_ONLY',
+      })
+      return { content: [{ type: 'text' as const, text: JSON.stringify({ ok: true, propertyId, sharedWith: CENTRAL_USERNAME }) }] }
+    }
+  )
+
+  // ── Data tools — all use central credentials, propertyId from connector ──────
+
+  server.tool(
+    'get_property',
+    'Get property details and current ENERGY STAR score using the stored propertyId.',
+    { propertyId: z.string() },
+    async ({ propertyId }) => {
+      const [details, metrics] = await Promise.all([
+        epaGet(`/property/${propertyId}`),
+        epaGet(`/property/${propertyId}/metrics`).catch(() => null),
+      ])
+      return { content: [{ type: 'text' as const, text: JSON.stringify({ property: details, metrics }, null, 2) }] }
+    }
+  )
+
+  server.tool(
+    'get_metrics',
+    'Get energy metrics for a property: ENERGY STAR score, site EUI (kBtu/ft²), source EUI, total GHG emissions (tCO2e).',
+    {
+      propertyId: z.string(),
+      year: z.number().optional().describe('Year (defaults to previous year)'),
+    },
+    async ({ propertyId, year }) => {
+      const targetYear = year ?? new Date().getFullYear() - 1
+      const data = await epaGet(`/property/${propertyId}/metrics?year=${targetYear}`)
+      return { content: [{ type: 'text' as const, text: JSON.stringify({ year: targetYear, propertyId, metrics: data }, null, 2) }] }
+    }
+  )
+
+  server.tool(
+    'get_meters',
+    'List all utility meters for a property.',
+    { propertyId: z.string() },
+    async ({ propertyId }) => {
+      const data = await epaGet(`/property/${propertyId}/meter/list`) as { links?: { link?: unknown[] } }
+      const links = data?.links?.link ?? []
+      const meters = (Array.isArray(links) ? links : [links]).map((l) => { const m = l as Record<string, unknown>; return ({
+        id: m['@_id'] ?? m.id,
+        name: m['@_hint'] ?? m.name,
+        type: m['@_type'],
+        unitOfMeasure: m['@_unitOfMeasure'],
+      })})
+      return { content: [{ type: 'text' as const, text: JSON.stringify(meters, null, 2) }] }
+    }
+  )
+
+  server.tool(
+    'submit_meter_data',
+    'Submit energy consumption data for a utility meter.',
+    {
+      meterId: z.string(),
+      startDate: z.string().describe('YYYY-MM-DD'),
+      endDate: z.string().describe('YYYY-MM-DD'),
+      usage: z.number(),
+      cost: z.number().optional(),
+    },
+    async ({ meterId, startDate, endDate, usage, cost }) => {
+      const result = await epaPost(`/meter/${meterId}/consumption`, CENTRAL_CREDS, {
+        meterConsumption: { startDate, endDate, usage, estimatedValue: false, ...(cost !== undefined ? { cost } : {}) },
+      })
+      return { content: [{ type: 'text' as const, text: JSON.stringify({ ok: true, meterId, result }, null, 2) }] }
+    }
+  )
+
+  server.tool(
+    'get_energy_star_score',
+    'Get the current ENERGY STAR score (1-100) and national percentile for a property.',
+    { propertyId: z.string() },
+    async ({ propertyId }) => {
+      const data = await epaGet(`/property/${propertyId}/metrics`) as Record<string, unknown>
+      const score = (data as Record<string, unknown>)?.score ?? (data as Record<string, unknown>)?.energyStarScore
+      return { content: [{ type: 'text' as const, text: JSON.stringify({ propertyId, energyStarScore: score, rawMetrics: data }, null, 2) }] }
     }
   )
 
   return server
 }
 
-// ── Hono app ──────────────────────────────────────────────────────────────────
+// ── Hono HTTP app ─────────────────────────────────────────────────────────────
 
 const app = new Hono()
 
+app.get('/health', (c) => c.json({ ok: true, service: 'energy-star-mcp', version: '0.2.0' }))
+
 app.post('/mcp', async (c) => {
-  const authHeader = c.req.header('Authorization')
-
-  if (!authHeader) {
-    return c.json({ error: 'Missing Authorization header' }, 401)
+  if (!CENTRAL_USERNAME || !CENTRAL_PASSWORD) {
+    return c.json({ error: 'ESPM_USERNAME and ESPM_PASSWORD env vars are required' }, 500)
   }
-
-  // Accept "Bearer <base64>" where base64 = btoa(username:password)
-  const credentials = authHeader.startsWith('Bearer ')
-    ? authHeader.slice(7).trim()
-    : authHeader.startsWith('Basic ')
-      ? authHeader.slice(6).trim()
-      : null
-
-  if (!credentials) {
-    return c.json(
-      {
-        error:
-          'Authorization header must be "Bearer <base64_credentials>" where credentials = btoa(username:password)',
-      },
-      401
-    )
-  }
-
-  const server = createServer(credentials)
-  const transport = new WebStandardStreamableHTTPServerTransport({
-    sessionIdGenerator: undefined, // stateless
-  })
-
+  const server = createServer()
+  const transport = new WebStandardStreamableHTTPServerTransport({ sessionIdGenerator: undefined })
   await server.connect(transport)
-
-  // Convert Hono request to Web Standard Request
-  const req = c.req.raw
-  const response = await transport.handleRequest(req)
-  return response
+  return transport.handleRequest(c.req.raw)
 })
 
-app.get('/health', (c) => c.json({ status: 'ok', service: 'energy-star-mcp' }))
-
-app.get('/', (c) =>
-  c.json({
-    name: 'ENERGY STAR Portfolio Manager MCP Server',
-    version: '0.1.0',
-    endpoint: 'POST /mcp',
-    auth: 'Authorization: Bearer <btoa(username:password)>',
-  })
-)
-
-// ── Start ─────────────────────────────────────────────────────────────────────
-
-serve(
-  {
-    fetch: app.fetch,
-    port: PORT,
-  },
-  (info) => {
-    console.log(`ENERGY STAR MCP server running on http://localhost:${info.port}`)
-    console.log(`  POST /mcp  — MCP endpoint`)
-    console.log(`  GET  /health — health check`)
-  }
-)
+serve({ fetch: app.fetch, port: PORT }, () => {
+  console.log(`energy-star-mcp running on :${PORT}`)
+  if (!CENTRAL_USERNAME) console.warn('WARNING: ESPM_USERNAME not set')
+})
