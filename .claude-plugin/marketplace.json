@@ -1,0 +1,10 @@
+{
+  "name": "energy-star-plugins",
+  "owner": { "name": "Soapbox", "url": "https://soapbox.build" },
+  "plugins": [{
+    "name": "energy-star-pm",
+    "source": { "source": "github", "repo": "soapboxbuild/energy-star-mcp" },
+    "description": "EPA ENERGY STAR Portfolio Manager — retrieve scores, EUI benchmarks, carbon estimates.",
+    "version": "0.2.0"
+  }]
+}

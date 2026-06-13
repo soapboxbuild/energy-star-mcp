@@ -1,0 +1,8 @@
+{
+  "name": "energy-star-pm",
+  "version": "0.2.0",
+  "description": "EPA ENERGY STAR Portfolio Manager — retrieve scores, EUI benchmarks, carbon estimates. Share your properties with api@soapbox.build to connect.",
+  "author": { "name": "EPA", "url": "https://www.energystar.gov" },
+  "homepage": "https://github.com/soapboxbuild/energy-star-mcp",
+  "license": "Apache-2.0"
+}
