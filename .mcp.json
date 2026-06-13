@@ -2,7 +2,7 @@
   "mcpServers": {
     "energy-star": {
       "type": "http",
-      "url": "https://energy-star-mcp-production.up.railway.app/mcp",
+      "url": "https://energy-star-mcp.mcp.soapbox.build/mcp",
       "headers": {}
     }
   }
