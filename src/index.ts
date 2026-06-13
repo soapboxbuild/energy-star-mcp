@@ -117,6 +117,23 @@ function createServer(): McpServer {
     }
   )
 
+  // ── Discovery: list all properties currently shared with central account ─────
+
+  server.tool(
+    'list_shared_properties',
+    'List all properties currently shared with the central Soapbox ENERGY STAR account. Use this to discover which client properties are already connected and accessible.',
+    {},
+    async () => {
+      const data = await epaGet('/property/list') as { links?: { link?: unknown[] } }
+      const links = data?.links?.link ?? []
+      const properties = (Array.isArray(links) ? links : [links]).map((p) => {
+        const prop = p as Record<string, unknown>
+        return { id: prop['@_id'] ?? prop.id, name: prop['@_hint'] ?? prop.name }
+      })
+      return { content: [{ type: 'text' as const, text: JSON.stringify({ count: properties.length, properties }, null, 2) }] }
+    }
+  )
+
   // ── Data tools — all use central credentials, propertyId from connector ──────
 
   server.tool(
