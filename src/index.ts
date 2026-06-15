@@ -7,11 +7,19 @@ import { z } from 'zod'
 const BASE_URL = 'https://portfoliomanager.energystar.gov/ws'
 const PORT = parseInt(process.env.PORT ?? '3000', 10)
 
-// Central Soapbox ESPM account — stored as env vars, used for all data fetches.
-// Users share their properties with this account during connect_property.
+// Central Soapbox ESPM account — fallback when no per-request credentials are supplied.
 const CENTRAL_USERNAME = process.env.ESPM_USERNAME ?? ''
 const CENTRAL_PASSWORD = process.env.ESPM_PASSWORD ?? ''
 const CENTRAL_CREDS = Buffer.from(`${CENTRAL_USERNAME}:${CENTRAL_PASSWORD}`).toString('base64')
+
+function resolveCredentials(authHeader: string): string {
+  if (authHeader.startsWith('Basic ')) return authHeader.slice(6).trim()
+  if (authHeader.startsWith('Bearer ')) {
+    // Accept "Bearer base64(user:pass)" as an alternative form
+    return authHeader.slice(7).trim()
+  }
+  return CENTRAL_CREDS
+}
 
 async function epaFetch(path: string, credentials: string, options: RequestInit = {}): Promise<Response> {
   return fetch(`${BASE_URL}${path}`, {
@@ -25,19 +33,19 @@ async function epaFetch(path: string, credentials: string, options: RequestInit 
   })
 }
 
-async function epaGet(path: string, credentials = CENTRAL_CREDS): Promise<unknown> {
+async function epaGet(path: string, credentials: string): Promise<unknown> {
   const res = await epaFetch(path, credentials)
   if (!res.ok) throw new Error(`EPA ${res.status} GET ${path}: ${await res.text()}`)
   return res.json()
 }
 
-async function epaPost(path: string, credentials = CENTRAL_CREDS, body: unknown): Promise<unknown> {
+async function epaPost(path: string, credentials: string, body: unknown): Promise<unknown> {
   const res = await epaFetch(path, credentials, { method: 'POST', body: JSON.stringify(body) })
   if (!res.ok) throw new Error(`EPA ${res.status} POST ${path}: ${await res.text()}`)
   return res.json()
 }
 
-function createServer(): McpServer {
+function createServer(requestCreds: string): McpServer {
   const server = new McpServer({ name: 'energy-star-portfolio-manager', version: '0.2.0' })
 
   // ── One-time setup: user provides their own PM credentials to find properties
@@ -55,7 +63,7 @@ function createServer(): McpServer {
       const userCreds = Buffer.from(`${userUsername}:${userPassword}`).toString('base64')
 
       // 1. List user's properties
-      const data = await epaGet('/property/list', userCreds) as { links?: { link?: unknown[] } }
+      const data = await epaGet('/property/list', userCreds) as { links?: { link?: unknown[] } }  // always use supplied user creds here
       const links = data?.links?.link ?? []
       const properties = (Array.isArray(links) ? links : [links]) as Array<Record<string, unknown>>
 
@@ -76,7 +84,7 @@ function createServer(): McpServer {
       if (propertyList.length === 1 && CENTRAL_USERNAME) {
         const propertyId = propertyList[0].id
         try {
-          await epaPost(`/property/${propertyId}/share`, userCreds, {
+          await epaPost(`/property/${propertyId}/share`, userCreds, {  // always use supplied user creds here
             accountUsername: CENTRAL_USERNAME,
             level: 'READ_ONLY',
           })
@@ -109,7 +117,7 @@ function createServer(): McpServer {
     },
     async ({ userUsername, userPassword, propertyId }) => {
       const userCreds = Buffer.from(`${userUsername}:${userPassword}`).toString('base64')
-      await epaPost(`/property/${propertyId}/share`, userCreds, {
+      await epaPost(`/property/${propertyId}/share`, userCreds, {  // always use supplied user creds here
         accountUsername: CENTRAL_USERNAME,
         level: 'READ_ONLY',
       })
@@ -124,7 +132,7 @@ function createServer(): McpServer {
     'List all properties currently shared with the central Soapbox ENERGY STAR account. Use this to discover which client properties are already connected and accessible.',
     {},
     async () => {
-      const data = await epaGet('/property/list') as { links?: { link?: unknown[] } }
+      const data = await epaGet('/property/list', requestCreds) as { links?: { link?: unknown[] } }
       const links = data?.links?.link ?? []
       const properties = (Array.isArray(links) ? links : [links]).map((p) => {
         const prop = p as Record<string, unknown>
@@ -142,8 +150,8 @@ function createServer(): McpServer {
     { propertyId: z.string() },
     async ({ propertyId }) => {
       const [details, metrics] = await Promise.all([
-        epaGet(`/property/${propertyId}`),
-        epaGet(`/property/${propertyId}/metrics`).catch(() => null),
+        epaGet(`/property/${propertyId}`, requestCreds),
+        epaGet(`/property/${propertyId}/metrics`, requestCreds).catch(() => null),
       ])
       return { content: [{ type: 'text' as const, text: JSON.stringify({ property: details, metrics }, null, 2) }] }
     }
@@ -158,7 +166,7 @@ function createServer(): McpServer {
     },
     async ({ propertyId, year }) => {
       const targetYear = year ?? new Date().getFullYear() - 1
-      const data = await epaGet(`/property/${propertyId}/metrics?year=${targetYear}`)
+      const data = await epaGet(`/property/${propertyId}/metrics?year=${targetYear}`, requestCreds)
       return { content: [{ type: 'text' as const, text: JSON.stringify({ year: targetYear, propertyId, metrics: data }, null, 2) }] }
     }
   )
@@ -168,7 +176,7 @@ function createServer(): McpServer {
     'List all utility meters for a property.',
     { propertyId: z.string() },
     async ({ propertyId }) => {
-      const data = await epaGet(`/property/${propertyId}/meter/list`) as { links?: { link?: unknown[] } }
+      const data = await epaGet(`/property/${propertyId}/meter/list`, requestCreds) as { links?: { link?: unknown[] } }
       const links = data?.links?.link ?? []
       const meters = (Array.isArray(links) ? links : [links]).map((l) => { const m = l as Record<string, unknown>; return ({
         id: m['@_id'] ?? m.id,
@@ -191,7 +199,7 @@ function createServer(): McpServer {
       cost: z.number().optional(),
     },
     async ({ meterId, startDate, endDate, usage, cost }) => {
-      const result = await epaPost(`/meter/${meterId}/consumption`, CENTRAL_CREDS, {
+      const result = await epaPost(`/meter/${meterId}/consumption`, requestCreds, {
         meterConsumption: { startDate, endDate, usage, estimatedValue: false, ...(cost !== undefined ? { cost } : {}) },
       })
       return { content: [{ type: 'text' as const, text: JSON.stringify({ ok: true, meterId, result }, null, 2) }] }
@@ -203,7 +211,7 @@ function createServer(): McpServer {
     'Get the current ENERGY STAR score (1-100) and national percentile for a property.',
     { propertyId: z.string() },
     async ({ propertyId }) => {
-      const data = await epaGet(`/property/${propertyId}/metrics`) as Record<string, unknown>
+      const data = await epaGet(`/property/${propertyId}/metrics`, requestCreds) as Record<string, unknown>
       const score = (data as Record<string, unknown>)?.score ?? (data as Record<string, unknown>)?.energyStarScore
       return { content: [{ type: 'text' as const, text: JSON.stringify({ propertyId, energyStarScore: score, rawMetrics: data }, null, 2) }] }
     }
@@ -219,10 +227,14 @@ const app = new Hono()
 app.get('/health', (c) => c.json({ ok: true, service: 'energy-star-mcp', version: '0.2.0' }))
 
 app.post('/mcp', async (c) => {
-  if (!CENTRAL_USERNAME || !CENTRAL_PASSWORD) {
-    return c.json({ error: 'ESPM_USERNAME and ESPM_PASSWORD env vars are required' }, 500)
+  const authHeader = c.req.header('Authorization') ?? c.req.header('authorization') ?? ''
+  const requestCreds = resolveCredentials(authHeader)
+
+  if (!requestCreds) {
+    return c.json({ error: 'Authorization header required (Basic base64(username:password)) or set ESPM_USERNAME/ESPM_PASSWORD env vars' }, 401)
   }
-  const server = createServer()
+
+  const server = createServer(requestCreds)
   const transport = new WebStandardStreamableHTTPServerTransport({ sessionIdGenerator: undefined })
   await server.connect(transport)
   return transport.handleRequest(c.req.raw)
