@@ -26,9 +26,15 @@ export class EspmClient {
   private readonly queue = makeQueue()
 
   constructor(authHeader: string) {
-    // Soapbox proxy sends: Authorization: Bearer username:password
+    // Soapbox proxy sends: Authorization: Bearer <credential>
+    // The credential may be plain "username:password" OR already base64-encoded.
+    // Detect by attempting to decode: if the result is printable ASCII containing
+    // a colon, it's already base64 and we use it directly for Basic auth.
     const cred = authHeader.replace(/^Bearer\s+/i, '').trim()
-    this.basicAuth = 'Basic ' + Buffer.from(cred).toString('base64')
+    let decoded = ''
+    try { decoded = Buffer.from(cred, 'base64').toString('utf-8') } catch {}
+    const isAlreadyBase64 = decoded.includes(':') && /^[\x20-\x7E]+$/.test(decoded)
+    this.basicAuth = isAlreadyBase64 ? `Basic ${cred}` : `Basic ${Buffer.from(cred).toString('base64')}`
   }
 
   private async espmFetch(path: string): Promise<unknown> {
