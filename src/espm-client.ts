@@ -38,45 +38,48 @@ export class EspmClient {
   }
 
   private async login(): Promise<void> {
-    // Step 1: GET login page — grab initial session cookie and CSRF token
+    // Step 1: GET /pm/login to establish a SESSION cookie
     const loginRes = await fetch(`${PM_BASE}/pm/login`, {
       redirect: 'manual',
       headers: { 'User-Agent': 'Mozilla/5.0 PortfolioManager-MCP/1.0' },
     })
     const setCookie = loginRes.headers.get('set-cookie') ?? ''
-    const jsessionId = setCookie.match(/JSESSIONID=([^;]+)/)?.[1] ?? ''
+    // PM uses Spring Session cookie named SESSION (not JSESSIONID)
+    const sessionId = setCookie.match(/SESSION=([^;]+)/)?.[1] ?? ''
+    if (!sessionId) throw new EspmError('Could not establish PM session', 500)
+
     const html = await loginRes.text()
-    const csrf = html.match(/name="_csrf"\s+value="([^"]+)"/)?.[1] ?? ''
+    const csrf = html.match(/name="_csrf"[^>]*value="([^"]+)"/)?.[1] ?? ''
 
-    if (!jsessionId) throw new EspmError('Could not establish PM session', 500)
+    // Step 2: POST credentials to /pm/login (Spring Security processes it)
+    const body = new URLSearchParams({ username: this.username, password: this.password })
+    if (csrf) body.set('_csrf', csrf)
 
-    // Step 2: POST credentials to Spring Security login endpoint
-    const loginPost = await fetch(`${PM_BASE}/pm/j_spring_security_check`, {
+    const loginPost = await fetch(`${PM_BASE}/pm/login`, {
       method: 'POST',
       redirect: 'manual',
       headers: {
         'Content-Type': 'application/x-www-form-urlencoded',
-        'Cookie': `JSESSIONID=${jsessionId}`,
+        'Cookie': `SESSION=${sessionId}`,
         'User-Agent': 'Mozilla/5.0 PortfolioManager-MCP/1.0',
         'Referer': `${PM_BASE}/pm/login`,
       },
-      body: new URLSearchParams({
-        username: this.username,
-        password: this.password,
-        _csrf: csrf,
-      }).toString(),
+      body: body.toString(),
     })
 
-    // Spring Security redirects to /pm/home on success, /pm/login?error on failure
+    // Success redirects to /pm/ or /pm/home; failure redirects to /pm/login?error
     const location = loginPost.headers.get('location') ?? ''
-    if (location.includes('error') || location.includes('login')) {
+    if (location.includes('error') || (location.includes('login') && !location.endsWith('/pm/login'))) {
+      throw new EspmError('Invalid Portfolio Manager credentials', 401)
+    }
+    if (!location || location.includes('login')) {
       throw new EspmError('Invalid Portfolio Manager credentials', 401)
     }
 
-    // Extract the authenticated session cookie from the redirect response
-    const authCookie = loginPost.headers.get('set-cookie') ?? ''
-    const authSession = authCookie.match(/JSESSIONID=([^;]+)/)?.[1]
-    this.sessionCookie = authSession ? `JSESSIONID=${authSession}` : `JSESSIONID=${jsessionId}`
+    // The SESSION cookie may be rotated on successful login
+    const authSetCookie = loginPost.headers.get('set-cookie') ?? ''
+    const authSession = authSetCookie.match(/SESSION=([^;]+)/)?.[1]
+    this.sessionCookie = `SESSION=${authSession ?? sessionId}`
   }
 
   private async pmFetch(path: string): Promise<Response> {
@@ -91,7 +94,7 @@ export class EspmClient {
       },
     })
 
-    if (res.status === 403 || res.url.includes('/pm/login')) {
+    if (res.status === 403 || res.status === 302 || res.url.includes('/pm/login')) {
       // Session expired — re-login once and retry
       this.sessionCookie = null
       await this.login()
