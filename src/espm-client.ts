@@ -38,48 +38,36 @@ export class EspmClient {
   }
 
   private async login(): Promise<void> {
-    // Step 1: GET /pm/login to establish a SESSION cookie
-    const loginRes = await fetch(`${PM_BASE}/pm/login`, {
-      redirect: 'manual',
-      headers: { 'User-Agent': 'Mozilla/5.0 PortfolioManager-MCP/1.0' },
-    })
-    const setCookie = loginRes.headers.get('set-cookie') ?? ''
-    // PM uses Spring Session cookie named SESSION (not JSESSIONID)
-    const sessionId = setCookie.match(/SESSION=([^;]+)/)?.[1] ?? ''
-    if (!sessionId) throw new EspmError('Could not establish PM session', 500)
-
-    const html = await loginRes.text()
-    const csrf = html.match(/name="_csrf"[^>]*value="([^"]+)"/)?.[1] ?? ''
-
-    // Step 2: POST credentials to /pm/login (Spring Security processes it)
-    const body = new URLSearchParams({ username: this.username, password: this.password })
-    if (csrf) body.set('_csrf', csrf)
-
-    const loginPost = await fetch(`${PM_BASE}/pm/login`, {
+    // Direct POST — PM sets SESSION cookie on the login response itself, no prior GET needed
+    const res = await fetch(`${PM_BASE}/pm/login`, {
       method: 'POST',
       redirect: 'manual',
       headers: {
         'Content-Type': 'application/x-www-form-urlencoded',
-        'Cookie': `SESSION=${sessionId}`,
         'User-Agent': 'Mozilla/5.0 PortfolioManager-MCP/1.0',
         'Referer': `${PM_BASE}/pm/login`,
       },
-      body: body.toString(),
+      body: new URLSearchParams({ username: this.username, password: this.password }).toString(),
     })
 
-    // Success redirects to /pm/ or /pm/home; failure redirects to /pm/login?error
-    const location = loginPost.headers.get('location') ?? ''
-    if (location.includes('error') || (location.includes('login') && !location.endsWith('/pm/login'))) {
-      throw new EspmError('Invalid Portfolio Manager credentials', 401)
-    }
-    if (!location || location.includes('login')) {
+    // Node.js 22 fetch: use getSetCookie() to read all Set-Cookie headers
+    const cookies: string[] = typeof (res.headers as any).getSetCookie === 'function'
+      ? (res.headers as any).getSetCookie()
+      : [res.headers.get('set-cookie') ?? '']
+
+    const sessionCookie = cookies.find(c => c.startsWith('SESSION='))
+    const sessionId = sessionCookie?.match(/SESSION=([^;]+)/)?.[1]
+
+    if (!sessionId) throw new EspmError('Could not establish PM session — check credentials', 500)
+
+    // Success: location redirects to /pm/ or /pm/home
+    // Failure: location contains "error" or redirects back to /pm/login
+    const location = res.headers.get('location') ?? ''
+    if (!location || location.includes('error') || /\/pm\/login[?#]/.test(location)) {
       throw new EspmError('Invalid Portfolio Manager credentials', 401)
     }
 
-    // The SESSION cookie may be rotated on successful login
-    const authSetCookie = loginPost.headers.get('set-cookie') ?? ''
-    const authSession = authSetCookie.match(/SESSION=([^;]+)/)?.[1]
-    this.sessionCookie = `SESSION=${authSession ?? sessionId}`
+    this.sessionCookie = `SESSION=${sessionId}`
   }
 
   private async pmFetch(path: string): Promise<Response> {
