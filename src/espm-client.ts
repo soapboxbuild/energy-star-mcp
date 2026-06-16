@@ -1,4 +1,11 @@
+import { createHash } from 'node:crypto'
+
 const PM_BASE = 'https://portfoliomanager.energystar.gov'
+const SESSION_TTL_MS = 25 * 60 * 1000 // 25 min — PM sessions last ~30 min
+
+// Process-level session cache: credentialHash → { cookie, expiresAt }
+// Cleared on server restart. Safe: each entry is keyed to one user's credentials.
+const sessionCache = new Map<string, { cookie: string; expiresAt: number }>()
 
 export class EspmError extends Error {
   constructor(message: string, public readonly statusCode: number) {
@@ -19,6 +26,7 @@ export class EspmError extends Error {
 export class EspmClient {
   private readonly username: string
   private readonly password: string
+  private readonly cacheKey: string
   private sessionCookie: string | null = null
 
   constructor(authHeader: string) {
@@ -35,6 +43,13 @@ export class EspmClient {
     const colonIdx = cred.indexOf(':')
     this.username = colonIdx >= 0 ? cred.slice(0, colonIdx) : cred
     this.password = colonIdx >= 0 ? cred.slice(colonIdx + 1) : ''
+    this.cacheKey = createHash('sha256').update(cred).digest('hex')
+
+    // Restore cached session if still valid
+    const cached = sessionCache.get(this.cacheKey)
+    if (cached && cached.expiresAt > Date.now()) {
+      this.sessionCookie = cached.cookie
+    }
   }
 
   private async login(): Promise<void> {
@@ -68,6 +83,7 @@ export class EspmClient {
     }
 
     this.sessionCookie = `SESSION=${sessionId}`
+    sessionCache.set(this.cacheKey, { cookie: this.sessionCookie, expiresAt: Date.now() + SESSION_TTL_MS })
   }
 
   private async pmFetch(path: string): Promise<Response> {
@@ -83,8 +99,9 @@ export class EspmClient {
     })
 
     if (res.status === 403 || res.status === 302 || res.url.includes('/pm/login')) {
-      // Session expired — re-login once and retry
+      // Session expired — clear cache, re-login once and retry
       this.sessionCookie = null
+      sessionCache.delete(this.cacheKey)
       await this.login()
       return fetch(`${PM_BASE}${path}`, {
         headers: {
