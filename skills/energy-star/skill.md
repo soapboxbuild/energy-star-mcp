@@ -1,56 +1,65 @@
 ---
 name: energy-star
 description: >
-  Retrieve ENERGY STAR scores, EUI benchmarks, carbon emissions, and utility
-  consumption from EPA Portfolio Manager for any property. Triggers on:
+  Retrieve ENERGY STAR scores, EUI benchmarks, carbon emissions, and monthly
+  utility consumption from EPA Portfolio Manager. Also used to calibrate Audette
+  energy models with real consumption data. Triggers on:
   "energy star score", "ESPM", "portfolio manager", "EUI", "energy use
   intensity", "ENERGY STAR certification", "benchmark energy",
-  "utility consumption", "carbon emissions portfolio manager".
+  "utility consumption", "calibrate Audette", "import energy data",
+  "energy bills", "monthly consumption".
 ---
 
 # ENERGY STAR Portfolio Manager
 
-Retrieve benchmarking data for properties in the user's ESPM account.
+Retrieve benchmarking and consumption data for properties in the user's ESPM account.
 
-## Workflow
+## Property ID
 
-Always follow this sequence:
+If the asset has a linked ESPM property ID (shown in the system prompt as "ENERGY STAR Property"), use it directly. Do not call `list_properties`.
 
-1. `get_account` — retrieves the accountId needed for subsequent calls. Call once per session.
-2. `list_properties` — returns all properties with propertyId and name. Find the target property by name or address match.
-3. `get_metrics(propertyId)` — ENERGY STAR score, site EUI, source EUI, GHG emissions.
-4. If consumption detail is needed: `list_meters(propertyId)` → `get_meter_consumption(meterId)`.
+If no property ID is linked, call `list_properties` to find the property by name or address.
+
+## Audette Calibration Workflow
+
+When asked to calibrate Audette, import energy data, or submit utility bills from ESPM:
+
+1. `get_meter_consumption(espmPropertyId)` — returns monthly data by fuel type with kWh and therms pre-converted
+2. Review the data: confirm months of coverage, flag any gaps
+3. For each fuel type, submit 12–24 months to Audette using `audette_add_utility_data` (or equivalent Audette tool):
+   - **Electricity**: use `usage_kWh` values (1 GJ = 277.778 kWh)
+   - **Natural Gas**: use `usage_therms` values (1 GJ = 9.4782 therms)
+   - Each month: `startDate`, `endDate`, and usage value
+4. Confirm submission and note the date range imported
+
+**Important:** Do not stop to summarise after step 1 — continue directly to submission unless data is missing or ambiguous.
+
+## Benchmarking Workflow
+
+1. `get_metrics(propertyId)` — ENERGY STAR score, site EUI, source EUI, GHG emissions
+2. `get_property(propertyId)` — floor area, property type (for EUI comparison)
 
 ## Key Interpretation Rules
 
 **ENERGY STAR Score:**
-- Score of 75+ qualifies for ENERGY STAR certification
-- Score below 50 is at-risk — bottom quartile of similar buildings
-- `scoreEligible: false` means the property type doesn't qualify for a numeric score (only ~30 building types do). Report EUI only for these.
-- Always report the score year alongside the score — "ENERGY STAR Score: 82 (2025)"
+- 75+ qualifies for ENERGY STAR certification
+- Below 50 is at-risk — bottom quartile
+- `scoreEligible: false` means the property type doesn't qualify — report EUI only
+- Always report the score year: "ENERGY STAR Score: 82 (2025)"
 
-**Site EUI (Energy Use Intensity):**
-- Units: kBtu/sq ft/year. Lower = better.
-- National median benchmarks by primary function (approximate):
-  - Office: ~90 kBtu/ft²
-  - K-12 School: ~65 kBtu/ft²
-  - Hotel/Motel: ~120 kBtu/ft²
-  - Retail Store: ~75 kBtu/ft²
-  - Multifamily Housing: ~65 kBtu/ft²
-  - Hospital (General): ~400 kBtu/ft²
-  - Warehouse (Unrefrigerated): ~40 kBtu/ft²
-- Always compare against the national median for the property's primaryFunction
+**Site EUI (kBtu/sq ft/year — lower is better):**
+- Office: ~90 | K-12 School: ~65 | Hotel: ~120 | Retail: ~75
+- Multifamily: ~65 | Hospital: ~400 | Warehouse: ~40
 
-**GHG Emissions:**
-- `totalGHGEmissions` in metric tons CO₂e
-- Divide by gross floor area to get emissions intensity (kg CO₂e/ft²)
+**GHG:** `totalGHGEmissions` in metric tons CO₂e. Divide by GFA for intensity.
 
-**Meter Types:**
-- Common values: Electricity, Natural Gas, Chilled Water, Steam, Fuel Oil (No. 2), Propane
-- Electricity units: kWh. Natural Gas units: therms or CCF.
+**Consumption data units:** PM returns GJ. Pre-converted values in the response:
+- `usage_kWh` — electricity only (null for gas)
+- `usage_therms` — natural gas only (null for electricity)
 
 ## Error Handling
 
-- If `get_account` fails with 401: user's ESPM credentials are incorrect — ask them to re-enter
-- If `get_metrics` returns `scoreEligible: false`: property type doesn't qualify — report EUI only
-- If a property shows no score for the current year: data may not yet be available — try year - 1
+- 401 on `get_account`: credentials incorrect — ask user to re-enter in plugin settings
+- `scoreEligible: false`: property type ineligible — show EUI only
+- No data / `notInitialized: true`: property has no meter data submitted in ESPM
+- Gaps in monthly data: flag to user before submitting to Audette

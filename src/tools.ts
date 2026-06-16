@@ -58,13 +58,13 @@ export function registerTools(server: McpServer, client: EspmClient): void {
 
   server.tool(
     'get_meter_consumption',
-    'Get energy consumption data for a property, broken down by fuel type and time period.',
+    'Get monthly energy consumption for a property, broken down by fuel type (Electric - Grid, Natural Gas, etc.). Returns GJ values plus pre-converted kWh (electricity) and therms (gas). Use this to calibrate Audette — pass the monthly data directly to Audette\'s add_utility_data tool.',
     {
       propertyId: z.number().int().positive().describe('ESPM property ID'),
       startDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional()
-        .describe('Start date YYYY-MM-DD. Defaults to 24 months ago.'),
+        .describe('Start date filter YYYY-MM-DD. Omit for all available data.'),
       endDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional()
-        .describe('End date YYYY-MM-DD. Defaults to today.'),
+        .describe('End date filter YYYY-MM-DD. Omit for all available data.'),
     },
     ({ propertyId, startDate, endDate }) => wrap(() => client.getMeterConsumption(propertyId, startDate, endDate)),
   )

@@ -179,24 +179,66 @@ export class EspmClient {
     const res = await this.pmFetch(`/pm/property/${propertyId}/energyUsage/chart?_=${Date.now()}`)
     if (!res.ok) throw new EspmError(`Could not fetch energy data for property ${propertyId}`, res.status)
     const data = await res.json() as any
-    // energyUsage/chart returns meter types with consumption summaries
-    const series: any[] = data?.series ?? data?.energySeries ?? []
-    return series.map((s: any, i: number) => ({
-      meterId: i,
-      name: String(s.name ?? s.label ?? `Meter ${i + 1}`),
-      type: String(s.name ?? s.label ?? ''),
-      units: String(s.units ?? s.unit ?? ''),
-    }))
+    const series: any[] = data?.series ?? []
+    return series
+      .filter((s: any) => Array.isArray(s.data) && s.data.length > 0)
+      .map((s: any, i: number) => ({
+        meterId: i,
+        name: String(s.name ?? `Meter ${i + 1}`),
+        type: String(s.name ?? ''),
+        monthsOfData: s.data.length,
+        units: 'GJ',
+      }))
   }
 
+  /**
+   * Get monthly energy consumption for Audette calibration.
+   *
+   * Returns data by fuel type (Electric - Grid, Natural Gas, etc.) with:
+   * - startDate / endDate as ISO date strings
+   * - usage_GJ: raw value in gigajoules (PM's native unit)
+   * - usage_kWh: converted for electricity (1 GJ = 277.778 kWh)
+   * - usage_therms: converted for gas (1 GJ = 9.4782 therms)
+   *
+   * Pass to Audette's add_utility_data tool directly.
+   * Audette accepts kWh for electricity and therms or GJ for gas.
+   */
   async getMeterConsumption(
     propertyId: number,
-    _startDate?: string,
-    _endDate?: string,
-  ): Promise<Array<Record<string, unknown>>> {
+    startDate?: string,
+    endDate?: string,
+  ): Promise<Array<{ fuelType: string; months: Array<Record<string, unknown>> }>> {
     const res = await this.pmFetch(`/pm/property/${propertyId}/energyUsage/chart?_=${Date.now()}`)
     if (!res.ok) throw new EspmError(`Could not fetch energy data for property ${propertyId}`, res.status)
     const data = await res.json() as any
-    return data?.series ?? data?.energySeries ?? []
+    const series: any[] = data?.series ?? []
+
+    const filterStart = startDate ? new Date(startDate).getTime() : 0
+    const filterEnd = endDate ? new Date(endDate).getTime() : Infinity
+
+    return series
+      .filter((s: any) => Array.isArray(s.data) && s.data.length > 0)
+      .map((s: any) => {
+        const fuelType = String(s.name ?? 'Unknown')
+        const isElec = /electric/i.test(fuelType)
+        const isGas = /natural.gas|gas/i.test(fuelType)
+
+        const months = (s.data as Array<[number, number]>)
+          .filter(([ts]) => ts >= filterStart && ts <= filterEnd)
+          .map(([ts, gjValue]) => {
+            const start = new Date(ts)
+            const end = new Date(start.getFullYear(), start.getMonth() + 1, 0) // end of same month
+            return {
+              startDate: start.toISOString().slice(0, 10),
+              endDate: end.toISOString().slice(0, 10),
+              usage_GJ: gjValue,
+              usage_kWh: isElec ? Math.round(gjValue * 277.778 * 10) / 10 : null,
+              usage_therms: isGas ? Math.round(gjValue * 9.4782 * 10) / 10 : null,
+            }
+          })
+          .sort((a, b) => a.startDate.localeCompare(b.startDate))
+
+        return { fuelType, months }
+      })
   }
 }
