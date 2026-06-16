@@ -19,14 +19,14 @@ async function wrap(fn: () => Promise<unknown>): Promise<ToolResult> {
 export function registerTools(server: McpServer, client: EspmClient): void {
   server.tool(
     'get_account',
-    'Get the authenticated ESPM account ID and username. Call this once at the start of a session before list_properties.',
+    'Verify Portfolio Manager credentials and return the username. Call this first to confirm the connection works before listing properties.',
     {},
     () => wrap(() => client.getAccount()),
   )
 
   server.tool(
     'list_properties',
-    'List all properties in the ESPM account. Returns propertyId and name for each. Call get_account first.',
+    'List all properties in the PM account. Returns propertyId and name for each.',
     {},
     () => wrap(() => client.listProperties()),
   )
@@ -51,21 +51,21 @@ export function registerTools(server: McpServer, client: EspmClient): void {
 
   server.tool(
     'list_meters',
-    'List all energy and water meters for a property. Returns meterId, type (Electricity, Natural Gas, Steam, etc.), name, and units.',
+    'List energy meter types for a property (Electricity, Natural Gas, Steam, etc.) with consumption summaries.',
     { propertyId: z.number().int().positive().describe('ESPM property ID') },
     ({ propertyId }) => wrap(() => client.listMeters(propertyId)),
   )
 
   server.tool(
     'get_meter_consumption',
-    'Get monthly consumption data for a meter. Defaults to last 24 months. Returns usage, cost, and whether the value was estimated for each billing period.',
+    'Get energy consumption data for a property, broken down by fuel type and time period.',
     {
-      meterId: z.number().int().positive().describe('ESPM meter ID from list_meters'),
+      propertyId: z.number().int().positive().describe('ESPM property ID'),
       startDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional()
         .describe('Start date YYYY-MM-DD. Defaults to 24 months ago.'),
       endDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional()
         .describe('End date YYYY-MM-DD. Defaults to today.'),
     },
-    ({ meterId, startDate, endDate }) => wrap(() => client.getMeterConsumption(meterId, startDate, endDate)),
+    ({ propertyId, startDate, endDate }) => wrap(() => client.getMeterConsumption(propertyId, startDate, endDate)),
   )
 }

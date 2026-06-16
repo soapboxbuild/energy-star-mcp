@@ -4,97 +4,108 @@ import { EspmClient, EspmError } from '../espm-client.js'
 const mockFetch = vi.fn()
 vi.stubGlobal('fetch', mockFetch)
 
-function xmlRes(body: string, status = 200) {
-  return Promise.resolve(new Response(body, {
-    status,
-    headers: { 'Content-Type': 'application/xml' },
-  }))
+function htmlRes(body: string, status = 200, headers: Record<string, string> = {}) {
+  return Promise.resolve(new Response(body, { status, headers: { 'Content-Type': 'text/html', ...headers } }))
+}
+function jsonRes(body: unknown, status = 200) {
+  return Promise.resolve(new Response(JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json' } }))
+}
+
+const LOGIN_HTML = `<html><body>
+  <form><input name="_csrf" value="test-csrf-token"><input name="username" value=""><input name="password" value=""></form>
+</body></html>`
+
+function mockLoginSuccess() {
+  mockFetch.mockResolvedValueOnce(htmlRes(LOGIN_HTML, 200, { 'set-cookie': 'JSESSIONID=initial123; Path=/; HttpOnly' }))
+  mockFetch.mockResolvedValueOnce(htmlRes('', 302, { 'location': '/pm/home', 'set-cookie': 'JSESSIONID=auth456; Path=/; HttpOnly' }))
 }
 
 describe('EspmClient', () => {
   let client: EspmClient
 
-  beforeEach(() => {
-    vi.clearAllMocks()
-    client = new EspmClient('Bearer myuser:mypassword')
+  beforeEach(() => { vi.clearAllMocks() })
+
+  describe('credential parsing', () => {
+    it('parses plain username:password from Bearer header', () => {
+      client = new EspmClient('Bearer myuser:mypassword')
+      expect((client as any).username).toBe('myuser')
+      expect((client as any).password).toBe('mypassword')
+    })
+
+    it('decodes pre-encoded base64 credentials', () => {
+      const b64 = Buffer.from('AudetteAnalytics:WPX8yxp9cbv1krm!efn').toString('base64')
+      client = new EspmClient(`Bearer ${b64}`)
+      expect((client as any).username).toBe('AudetteAnalytics')
+      expect((client as any).password).toBe('WPX8yxp9cbv1krm!efn')
+    })
+
+    it('handles password containing colons', () => {
+      client = new EspmClient('Bearer user:pass:word')
+      expect((client as any).username).toBe('user')
+      expect((client as any).password).toBe('pass:word')
+    })
   })
 
-  it('converts Bearer credential to Basic auth header', async () => {
-    mockFetch.mockReturnValueOnce(xmlRes(
-      '<account><id>42</id><username>myuser</username><email>me@test.com</email></account>'
-    ))
-    await client.getAccount()
-    const [, opts] = mockFetch.mock.calls[0]
-    expect(opts.headers.Authorization).toBe(
-      'Basic ' + Buffer.from('myuser:mypassword').toString('base64')
-    )
+  describe('login', () => {
+    beforeEach(() => { client = new EspmClient('Bearer myuser:mypassword') })
+
+    it('POSTs credentials and csrf to j_spring_security_check', async () => {
+      mockLoginSuccess()
+      await client.getAccount()
+      const call = mockFetch.mock.calls[1]
+      expect(call[0]).toContain('/pm/j_spring_security_check')
+      expect(call[1].body).toContain('username=myuser')
+      expect(call[1].body).toContain('password=mypassword')
+      expect(call[1].body).toContain('_csrf=test-csrf-token')
+    })
+
+    it('throws EspmError 401 on invalid credentials', async () => {
+      mockFetch.mockResolvedValueOnce(htmlRes(LOGIN_HTML, 200, { 'set-cookie': 'JSESSIONID=x; Path=/' }))
+      mockFetch.mockResolvedValueOnce(htmlRes('', 302, { 'location': '/pm/login?error=true' }))
+      await expect(client.getAccount()).rejects.toBeInstanceOf(EspmError)
+    })
+
+    it('throws EspmError 500 if no session cookie', async () => {
+      mockFetch.mockResolvedValueOnce(htmlRes(LOGIN_HTML, 200))
+      await expect(client.getAccount()).rejects.toBeInstanceOf(EspmError)
+    })
   })
 
-  it('getAccount returns parsed account', async () => {
-    mockFetch.mockReturnValueOnce(xmlRes(
-      '<account><id>42</id><username>myuser</username><email>me@test.com</email></account>'
-    ))
-    expect(await client.getAccount()).toEqual({ accountId: 42, username: 'myuser', email: 'me@test.com' })
+  describe('listProperties', () => {
+    beforeEach(() => { client = new EspmClient('Bearer myuser:mypassword') })
+
+    it('returns array from dashboardView properties', async () => {
+      mockLoginSuccess()
+      mockFetch.mockResolvedValueOnce(jsonRes({ properties: [{ id: 101, name: 'My Office' }, { id: 202, name: 'My Warehouse' }] }))
+      const result = await client.listProperties()
+      expect(result).toEqual([{ propertyId: 101, name: 'My Office' }, { propertyId: 202, name: 'My Warehouse' }])
+      expect(mockFetch.mock.calls[2][0]).toContain('/pm/account/dashboardView')
+    })
+
+    it('returns empty array when properties missing', async () => {
+      mockLoginSuccess()
+      mockFetch.mockResolvedValueOnce(jsonRes({ groups: [] }))
+      expect(await client.listProperties()).toEqual([])
+    })
   })
 
-  it('listProperties returns id+name array', async () => {
-    mockFetch
-      .mockReturnValueOnce(xmlRes('<account><id>42</id><username>u</username><email>e</email></account>'))
-      .mockReturnValueOnce(xmlRes(`
-        <response><links>
-          <link id="101" hint="My Office" />
-          <link id="202" hint="My Warehouse" />
-        </links></response>
-      `))
-    expect(await client.listProperties()).toEqual([
-      { propertyId: 101, name: 'My Office' },
-      { propertyId: 202, name: 'My Warehouse' },
-    ])
-  })
+  describe('getMetrics', () => {
+    beforeEach(() => { client = new EspmClient('Bearer myuser:mypassword') })
 
-  it('getMetrics returns score and EUI', async () => {
-    mockFetch.mockReturnValueOnce(xmlRes(`
-      <propertyMetrics>
-        <metric name="score" value="82" units="" />
-        <metric name="siteEUI" value="45.2" units="kBtu/ft²" />
-        <metric name="sourceEUI" value="68.1" units="kBtu/ft²" />
-        <metric name="totalGHGEmissions" value="110.5" units="MtCO2e" />
-      </propertyMetrics>
-    `))
-    const m = await client.getMetrics(101, 2025)
-    expect(m.energyStarScore).toBe(82)
-    expect(m.scoreEligible).toBe(true)
-    expect(m.siteEUI).toBe(45.2)
-    expect(m.year).toBe(2025)
-  })
+    it('marks scoreEligible false when whyNotScoreAlert present', async () => {
+      mockLoginSuccess()
+      mockFetch.mockResolvedValueOnce(jsonRes({ billboardRow: JSON.stringify({ colValues: [] }), whyNotScoreAlert: 'Not eligible' }))
+      const r = await client.getMetrics(101)
+      expect(r.scoreEligible).toBe(false)
+      expect(r.whyNotScoreAlert).toBe('Not eligible')
+    })
 
-  it('getMetrics marks scoreEligible false when score absent', async () => {
-    mockFetch.mockReturnValueOnce(xmlRes(
-      '<propertyMetrics><metric name="siteEUI" value="60.0" units="kBtu/ft²" /></propertyMetrics>'
-    ))
-    const m = await client.getMetrics(101)
-    expect(m.energyStarScore).toBeNull()
-    expect(m.scoreEligible).toBe(false)
-  })
-
-  it('throws EspmError on ESPM API error', async () => {
-    mockFetch.mockReturnValueOnce(xmlRes(
-      '<errors><error><message>Property not found</message></error></errors>',
-      404
-    ))
-    await expect(client.getMetrics(999)).rejects.toBeInstanceOf(EspmError)
-  })
-
-  it('getMeterConsumption defaults to last 24 months and returns sorted entries', async () => {
-    mockFetch.mockReturnValueOnce(xmlRes(`
-      <meterData>
-        <meterConsumption startDate="2025-01-01" endDate="2025-01-31" usage="1200" cost="180" estimatedValue="false" />
-      </meterData>
-    `))
-    const result = await client.getMeterConsumption(55)
-    expect(result).toHaveLength(1)
-    expect(result[0]).toMatchObject({ startDate: '2025-01-01', usage: 1200, estimatedValue: false })
-    const [url] = mockFetch.mock.calls[0]
-    expect(url).toMatch(/startDate=\d{4}-\d{2}-\d{2}&endDate=\d{4}-\d{2}-\d{2}/)
+    it('marks scoreEligible true and extracts score when no alert', async () => {
+      mockLoginSuccess()
+      mockFetch.mockResolvedValueOnce(jsonRes({ billboardRow: JSON.stringify({ colValues: [{ currentValue: '82' }, { currentValue: '45.2' }] }), whyNotScoreAlert: null }))
+      const r = await client.getMetrics(101)
+      expect(r.scoreEligible).toBe(true)
+      expect(r.energyStarScore).toBe(82)
+    })
   })
 })
