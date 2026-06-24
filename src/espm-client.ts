@@ -1,6 +1,8 @@
 import { createHash } from 'node:crypto'
+import { XMLBuilder, XMLParser } from 'fast-xml-parser'
 
 const PM_BASE = 'https://portfoliomanager.energystar.gov'
+const WS_BASE = 'https://portfoliomanager.energystar.gov/ws' // Official REST API (Basic Auth + XML)
 const SESSION_TTL_MS = 25 * 60 * 1000 // 25 min — PM sessions last ~30 min
 
 // Process-level session cache: credentialHash → { cookie, expiresAt }
@@ -114,6 +116,61 @@ export class EspmClient {
     }
 
     return res
+  }
+
+  // ── Official REST API (Basic Auth + XML) ─────────────────────────────────────
+  private get basicAuth(): string {
+    return `Basic ${Buffer.from(`${this.username}:${this.password}`).toString('base64')}`
+  }
+
+  private async wsGet(path: string): Promise<any> {
+    const res = await fetch(`${WS_BASE}${path}`, {
+      headers: { Authorization: this.basicAuth, Accept: 'application/xml', 'User-Agent': 'PortfolioManager-MCP/1.0' },
+    })
+    if (!res.ok) throw new EspmError(`REST API error on GET ${path}: HTTP ${res.status}`, res.status)
+    const xml = await res.text()
+    const parser = new XMLParser({ ignoreAttributes: false, attributeNamePrefix: '@_', parseAttributeValue: true })
+    return parser.parse(xml)
+  }
+
+  private async wsPost(path: string, xmlBody: string): Promise<any> {
+    const res = await fetch(`${WS_BASE}${path}`, {
+      method: 'POST',
+      headers: { Authorization: this.basicAuth, 'Content-Type': 'application/xml', Accept: 'application/xml', 'User-Agent': 'PortfolioManager-MCP/1.0' },
+      body: xmlBody,
+    })
+    if (!res.ok) {
+      const body = await res.text().catch(() => '')
+      throw new EspmError(`REST API error on POST ${path}: HTTP ${res.status} — ${body.slice(0, 300)}`, res.status)
+    }
+    const xml = await res.text()
+    if (!xml.trim()) return { ok: true }
+    const parser = new XMLParser({ ignoreAttributes: false, attributeNamePrefix: '@_', parseAttributeValue: true })
+    return parser.parse(xml)
+  }
+
+  private async wsPut(path: string, xmlBody: string): Promise<any> {
+    const res = await fetch(`${WS_BASE}${path}`, {
+      method: 'PUT',
+      headers: { Authorization: this.basicAuth, 'Content-Type': 'application/xml', Accept: 'application/xml', 'User-Agent': 'PortfolioManager-MCP/1.0' },
+      body: xmlBody,
+    })
+    if (!res.ok) {
+      const body = await res.text().catch(() => '')
+      throw new EspmError(`REST API error on PUT ${path}: HTTP ${res.status} — ${body.slice(0, 300)}`, res.status)
+    }
+    const xml = await res.text()
+    if (!xml.trim()) return { ok: true }
+    const parser = new XMLParser({ ignoreAttributes: false, attributeNamePrefix: '@_', parseAttributeValue: true })
+    return parser.parse(xml)
+  }
+
+  private async wsDelete(path: string): Promise<void> {
+    const res = await fetch(`${WS_BASE}${path}`, {
+      method: 'DELETE',
+      headers: { Authorization: this.basicAuth, 'User-Agent': 'PortfolioManager-MCP/1.0' },
+    })
+    if (!res.ok) throw new EspmError(`REST API error on DELETE ${path}: HTTP ${res.status}`, res.status)
   }
 
   async getAccount(): Promise<{ username: string }> {
@@ -241,4 +298,217 @@ export class EspmClient {
         return { fuelType, months }
       })
   }
+
+  // ── Write operations (Official REST API) ──────────────────────────────────────
+
+  /** Create a new property in the PM account. Returns the new propertyId. */
+  async createProperty(params: {
+    name: string
+    primaryFunction: string
+    address: string
+    city: string
+    state: string
+    postalCode: string
+    country?: string
+    yearBuilt?: number
+    grossFloorArea?: number
+    grossFloorAreaUnits?: 'Square Feet' | 'Square Metres'
+    constructionStatus?: 'Existing' | 'New Construction'
+    isFederalProperty?: boolean
+  }): Promise<{ propertyId: number }> {
+    const gfa = params.grossFloorArea
+    const gfaUnits = params.grossFloorAreaUnits ?? 'Square Metres'
+    const xml = `<?xml version="1.0" encoding="UTF-8"?>
+<property>
+  <name>${esc(params.name)}</name>
+  <primaryFunction>${esc(params.primaryFunction)}</primaryFunction>
+  <yearBuilt>${params.yearBuilt ?? ''}</yearBuilt>
+  <address>
+    <address1>${esc(params.address)}</address1>
+    <city>${esc(params.city)}</city>
+    <state>${esc(params.state)}</state>
+    <postalCode>${esc(params.postalCode)}</postalCode>
+    <country>${esc(params.country ?? 'US')}</country>
+  </address>
+  <constructionStatus>${params.constructionStatus ?? 'Existing'}</constructionStatus>
+  <isFederalProperty>${params.isFederalProperty ?? false}</isFederalProperty>
+  ${gfa != null ? `<grossFloorArea units="${esc(gfaUnits)}">${gfa}</grossFloorArea>` : ''}
+</property>`
+    const data = await this.wsPost('/account/property', xml)
+    const id = data?.response?.id ?? data?.id ?? data?.propertyId
+    if (!id) throw new EspmError('Property created but no ID returned', 500)
+    return { propertyId: Number(id) }
+  }
+
+  /** Update an existing property's attributes. */
+  async updateProperty(propertyId: number, params: {
+    name?: string
+    primaryFunction?: string
+    address?: string
+    city?: string
+    state?: string
+    postalCode?: string
+    country?: string
+    yearBuilt?: number
+    grossFloorArea?: number
+    grossFloorAreaUnits?: 'Square Feet' | 'Square Metres'
+    constructionStatus?: 'Existing' | 'New Construction'
+  }): Promise<{ ok: true }> {
+    // Fetch current values to merge
+    const current = await this.wsGet(`/property/${propertyId}`)
+    const p = current?.property ?? current
+    const xml = `<?xml version="1.0" encoding="UTF-8"?>
+<property>
+  <name>${esc(params.name ?? p?.name)}</name>
+  <primaryFunction>${esc(params.primaryFunction ?? p?.primaryFunction)}</primaryFunction>
+  <yearBuilt>${params.yearBuilt ?? p?.yearBuilt ?? ''}</yearBuilt>
+  <address>
+    <address1>${esc(params.address ?? p?.address?.address1 ?? '')}</address1>
+    <city>${esc(params.city ?? p?.address?.city ?? '')}</city>
+    <state>${esc(params.state ?? p?.address?.state ?? '')}</state>
+    <postalCode>${esc(params.postalCode ?? p?.address?.postalCode ?? '')}</postalCode>
+    <country>${esc(params.country ?? p?.address?.country ?? 'US')}</country>
+  </address>
+  <constructionStatus>${params.constructionStatus ?? p?.constructionStatus ?? 'Existing'}</constructionStatus>
+  <isFederalProperty>${p?.isFederalProperty ?? false}</isFederalProperty>
+  ${params.grossFloorArea != null ? `<grossFloorArea units="${esc(params.grossFloorAreaUnits ?? 'Square Metres')}">${params.grossFloorArea}</grossFloorArea>` : ''}
+</property>`
+    await this.wsPut(`/property/${propertyId}`, xml)
+    return { ok: true }
+  }
+
+  /** Add an energy or water meter to a property. Returns the new meterId. */
+  async addMeter(propertyId: number, params: {
+    name: string
+    type: 'Electric - Grid' | 'Natural Gas' | 'Municipal Potable Water' | 'Fuel Oil (No. 2)' | 'Propane' | 'District Steam' | 'District Hot Water' | 'District Chilled Water - Electric' | 'Wood' | 'Coal - Anthracite' | 'Coal - Bituminous' | 'Coke'
+    units: string
+    firstBillDate: string  // YYYY-MM-DD
+    inUse?: boolean
+  }): Promise<{ meterId: number }> {
+    const xml = `<?xml version="1.0" encoding="UTF-8"?>
+<meter>
+  <name>${esc(params.name)}</name>
+  <type>${esc(params.type)}</type>
+  <unitOfMeasure>${esc(params.units)}</unitOfMeasure>
+  <firstBillDate>${esc(params.firstBillDate)}</firstBillDate>
+  <inUse>${params.inUse ?? true}</inUse>
+</meter>`
+    const data = await this.wsPost(`/property/${propertyId}/meter`, xml)
+    const id = data?.response?.id ?? data?.id ?? data?.meterId
+    if (!id) throw new EspmError('Meter created but no ID returned', 500)
+    return { meterId: Number(id) }
+  }
+
+  /** List all meters for a property via the official API. */
+  async listMetersRest(propertyId: number): Promise<Array<{ meterId: number; name: string; type: string; units: string; inUse: boolean }>> {
+    const data = await this.wsGet(`/property/${propertyId}/meter/list`)
+    const links: any[] = data?.response?.links?.link ?? []
+    const meters: Array<{ meterId: number; name: string; type: string; units: string; inUse: boolean }> = []
+    for (const link of links) {
+      const mid = link['@_id'] ?? link.id
+      if (!mid) continue
+      try {
+        const m = await this.wsGet(`/meter/${mid}`)
+        const meter = m?.meter ?? m
+        meters.push({
+          meterId: Number(mid),
+          name: String(meter?.name ?? `Meter ${mid}`),
+          type: String(meter?.type ?? ''),
+          units: String(meter?.unitOfMeasure ?? ''),
+          inUse: meter?.inUse !== false,
+        })
+      } catch { /* skip inaccessible meters */ }
+    }
+    return meters
+  }
+
+  /** Submit monthly energy consumption entries for a meter. */
+  async submitMeterData(meterId: number, entries: Array<{
+    startDate: string   // YYYY-MM-DD
+    endDate: string     // YYYY-MM-DD
+    usage: number
+    cost?: number
+    estimatedValue?: boolean
+  }>): Promise<{ ok: true; entriesSubmitted: number }> {
+    const consumptionEntries = entries.map((e, i) => `
+  <meterConsumption>
+    <startDate>${esc(e.startDate)}</startDate>
+    <endDate>${esc(e.endDate)}</endDate>
+    <usage>${e.usage}</usage>
+    ${e.cost != null ? `<cost>${e.cost}</cost>` : ''}
+    <estimatedValue>${e.estimatedValue ?? false}</estimatedValue>
+  </meterConsumption>`).join('')
+    const xml = `<?xml version="1.0" encoding="UTF-8"?>
+<meterData>${consumptionEntries}
+</meterData>`
+    await this.wsPost(`/meter/${meterId}/consumptionData`, xml)
+    return { ok: true, entriesSubmitted: entries.length }
+  }
+
+  /** Delete a specific meter consumption entry. */
+  async deleteMeterEntry(meterId: number, consumptionDataId: number): Promise<{ ok: true }> {
+    await this.wsDelete(`/meter/${meterId}/consumptionData/${consumptionDataId}`)
+    return { ok: true }
+  }
+
+  /** Share a property with another PM user. */
+  async shareProperty(propertyId: number, params: {
+    toUsername: string
+    permission: 'Read Only' | 'Read Write' | 'None'
+    canShare?: boolean
+    includeMeters?: boolean
+  }): Promise<{ ok: true }> {
+    const xml = `<?xml version="1.0" encoding="UTF-8"?>
+<sharingRequest>
+  <toUsername>${esc(params.toUsername)}</toUsername>
+  <permission>${esc(params.permission)}</permission>
+  <canShare>${params.canShare ?? false}</canShare>
+  <includeMeters>${params.includeMeters ?? true}</includeMeters>
+</sharingRequest>`
+    await this.wsPost(`/property/${propertyId}/share`, xml)
+    return { ok: true }
+  }
+
+  /** Get ENERGY STAR score eligibility and apply for certification (75+ score required). */
+  async getScoreDetails(propertyId: number): Promise<Record<string, unknown>> {
+    const data = await this.wsGet(`/property/${propertyId}/metrics?year=${new Date().getFullYear() - 1}&month=12&measurementSystem=Metric`)
+    const metrics = data?.metrics?.metric ?? []
+    const byName = (name: string) => (Array.isArray(metrics) ? metrics : [metrics]).find((m: any) => m?.['@_name'] === name)
+    return {
+      energyStarScore: byName('ENERGY_STAR_SCORE')?.value ?? null,
+      siteEUI: byName('SITE_EUI')?.value ?? null,
+      sourceEUI: byName('SOURCE_EUI')?.value ?? null,
+      ghgEmissions: byName('GHG_EMISSIONS')?.value ?? null,
+      scoreEligible: byName('SCORE_ELIGIBLE')?.value === 'true',
+    }
+  }
+
+  /** Request a data quality check before applying for ENERGY STAR certification. */
+  async checkDataQuality(propertyId: number): Promise<Record<string, unknown>> {
+    const data = await this.wsGet(`/property/${propertyId}/verify`)
+    return data?.verificationResults ?? data ?? {}
+  }
+
+  /** Get list of valid primary function types for property creation. */
+  async listPropertyTypes(): Promise<string[]> {
+    return [
+      'Office', 'Hotel', 'K-12 School', 'Multifamily Housing', 'Retail Store',
+      'Senior Care Community', 'Hospital (General Medical and Surgical)',
+      'Supermarket/Grocery Store', 'Warehouse (Refrigerated)', 'Warehouse (Unrefrigerated)',
+      'Data Center', 'Financial Office', 'Courthouse', 'Medical Office',
+      'Worship Facility', 'Retail Store', 'Refrigerated Warehouse',
+      'Automobile Dealership', 'Bank Branch', 'College/University',
+      'Convenience Store without Gas Station', 'Convenience Store with Gas Station',
+      'Fast Food Restaurant', 'Restaurant', 'Distribution Center',
+      'Urgent Care/Clinic/Other Outpatient', 'Non-Refrigerated Warehouse',
+      'Mixed Use Property', 'Other',
+    ]
+  }
+}
+
+/** Escape XML special characters */
+function esc(s: string | number | undefined | null): string {
+  return String(s ?? '')
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/'/g, '&apos;')
 }
