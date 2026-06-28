@@ -188,7 +188,7 @@ export class EspmClient {
 
     // Enrich each property with address from REST API (in parallel, capped at 10 concurrent)
     const enriched: Array<{ propertyId: number; name: string; address: string | null; city: string | null; state: string | null; postalCode: string | null }> = []
-    const CONCURRENCY = 10
+    const CONCURRENCY = 50
     for (let i = 0; i < basic.length; i += CONCURRENCY) {
       const batch = basic.slice(i, i + CONCURRENCY)
       const results = await Promise.all(batch.map(async (p) => {
