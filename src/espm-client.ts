@@ -194,13 +194,13 @@ export class EspmClient {
       const results = await Promise.all(batch.map(async (p) => {
         try {
           const xml = await this.wsGet(`/property/${p.propertyId}`)
-          const addr = xml?.property?.address ?? xml?.['property']?.['address'] ?? null
+          const addr = xml?.property?.address ?? null
           return {
             ...p,
-            address: addr?.address1 ?? addr?.['address1'] ?? null,
-            city: addr?.city ?? null,
-            state: addr?.state ?? null,
-            postalCode: addr?.postalCode ?? addr?.['postalCode'] ?? null,
+            address: addr?.['@_address1'] ?? null,
+            city: addr?.['@_city'] ?? null,
+            state: addr?.['@_state'] ?? null,
+            postalCode: addr?.['@_postalCode'] ?? null,
           }
         } catch {
           return { ...p, address: null, city: null, state: null, postalCode: null }
@@ -223,10 +223,10 @@ export class EspmClient {
       grossFloorArea: detail?.propertyGFA?.value ? Number(detail.propertyGFA.value) : null,
       grossFloorAreaUnits: detail?.propertyGFA?.unitOfMeasure ?? 'Square Metres',
       notes: detail?.notes?.value ?? null,
-      address: addr?.address1 ?? null,
-      city: addr?.city ?? null,
-      state: addr?.state ?? null,
-      postalCode: addr?.postalCode ?? null,
+      address: addr?.['@_address1'] ?? null,
+      city: addr?.['@_city'] ?? null,
+      state: addr?.['@_state'] ?? null,
+      postalCode: addr?.['@_postalCode'] ?? null,
     }
   }
 
