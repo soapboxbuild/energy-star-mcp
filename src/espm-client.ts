@@ -179,24 +179,54 @@ export class EspmClient {
     return { username: this.username }
   }
 
-  async listProperties(): Promise<Array<{ propertyId: number; name: string }>> {
+  async listProperties(): Promise<Array<{ propertyId: number; name: string; address: string | null; city: string | null; state: string | null; postalCode: string | null }>> {
     const res = await this.pmFetch(`/pm/account/dashboardView?_=${Date.now()}`)
     if (!res.ok) throw new EspmError(`Failed to list properties: HTTP ${res.status}`, res.status)
     const data = await res.json() as any
     const props: any[] = data?.properties ?? []
-    return props.map(p => ({ propertyId: Number(p.id), name: String(p.name ?? p.id) }))
+    const basic = props.map(p => ({ propertyId: Number(p.id), name: String(p.name ?? p.id) }))
+
+    // Enrich each property with address from REST API (in parallel, capped at 10 concurrent)
+    const enriched: Array<{ propertyId: number; name: string; address: string | null; city: string | null; state: string | null; postalCode: string | null }> = []
+    const CONCURRENCY = 10
+    for (let i = 0; i < basic.length; i += CONCURRENCY) {
+      const batch = basic.slice(i, i + CONCURRENCY)
+      const results = await Promise.all(batch.map(async (p) => {
+        try {
+          const xml = await this.wsGet(`/property/${p.propertyId}`)
+          const addr = xml?.property?.address ?? xml?.['property']?.['address'] ?? null
+          return {
+            ...p,
+            address: addr?.address1 ?? addr?.['address1'] ?? null,
+            city: addr?.city ?? null,
+            state: addr?.state ?? null,
+            postalCode: addr?.postalCode ?? addr?.['postalCode'] ?? null,
+          }
+        } catch {
+          return { ...p, address: null, city: null, state: null, postalCode: null }
+        }
+      }))
+      enriched.push(...results)
+    }
+    return enriched
   }
 
   async getProperty(propertyId: number): Promise<Record<string, unknown>> {
-    const res = await this.pmFetch(`/pm/property/${propertyId}/detailsTabJson?_=${Date.now()}`)
-    if (!res.ok) throw new EspmError(`Property ${propertyId} not found`, res.status)
-    const d = await res.json() as any
+    const [detail, xml] = await Promise.all([
+      this.pmFetch(`/pm/property/${propertyId}/detailsTabJson?_=${Date.now()}`).then(r => r.ok ? r.json() as any : null).catch(() => null),
+      this.wsGet(`/property/${propertyId}`).catch(() => null),
+    ])
+    const addr = xml?.property?.address ?? null
     return {
       propertyId,
-      primaryFunction: d.propertyUseTypesList ? Object.values(d.propertyUseTypesList).join(', ') : null,
-      grossFloorArea: d.propertyGFA?.value ? Number(d.propertyGFA.value) : null,
-      grossFloorAreaUnits: d.propertyGFA?.unitOfMeasure ?? 'Square Metres',
-      notes: d.notes?.value ?? null,
+      primaryFunction: detail?.propertyUseTypesList ? Object.values(detail.propertyUseTypesList).join(', ') : null,
+      grossFloorArea: detail?.propertyGFA?.value ? Number(detail.propertyGFA.value) : null,
+      grossFloorAreaUnits: detail?.propertyGFA?.unitOfMeasure ?? 'Square Metres',
+      notes: detail?.notes?.value ?? null,
+      address: addr?.address1 ?? null,
+      city: addr?.city ?? null,
+      state: addr?.state ?? null,
+      postalCode: addr?.postalCode ?? null,
     }
   }
 

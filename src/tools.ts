@@ -26,7 +26,7 @@ export function registerTools(server: McpServer, client: EspmClient): void {
 
   server.tool(
     'list_properties',
-    'List all properties in the PM account. Returns propertyId and name for each.',
+    'List all properties in the PM account. Returns propertyId, name, and address (address, city, state, postalCode) for each.',
     {},
     () => wrap(() => client.listProperties()),
   )
