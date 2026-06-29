@@ -1,6 +1,7 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { z } from 'zod'
 import { EspmClient, EspmError } from './espm-client.js'
+import { euiPercentile, cbecMedian, VALID_ASSET_CLASSES, CBECS_CITATION, type AssetClass } from './cbecs-benchmarks.js'
 
 type ToolResult = { content: Array<{ type: 'text'; text: string }>; isError?: boolean }
 
@@ -184,5 +185,131 @@ export function registerTools(server: McpServer, client: EspmClient): void {
     'Run a data quality check before applying for ENERGY STAR certification. Identifies missing or inconsistent data.',
     { propertyId: z.number().int().positive() },
     ({ propertyId }) => wrap(() => client.checkDataQuality(propertyId)),
+  )
+
+  // ── Benchmarking tools (CBECS 2018 static dataset) ───────────────────────────
+
+  server.tool(
+    'get_peer_percentile',
+    `Return the EUI efficiency percentile and ENERGY STAR score percentile for a property vs. its asset-class peers. ` +
+    `EUI percentile = percentage of peer buildings with equal or higher site EUI (higher = more efficient). ` +
+    `ENERGY STAR score already represents a percentile directly when scoreEligible is true. ` +
+    `Valid asset classes: ${VALID_ASSET_CLASSES.join(', ')}.`,
+    {
+      propertyId: z.number().int().positive().describe('ESPM property ID from list_properties'),
+      assetClass: z.enum(VALID_ASSET_CLASSES as [AssetClass, ...AssetClass[]])
+        .describe('Asset class for peer group selection'),
+      year: z.number().int().min(2000).max(2035).optional()
+        .describe('Metrics year. Defaults to current calendar year.'),
+    },
+    ({ propertyId, assetClass, year }) => wrap(async () => {
+      const metrics = await client.getMetrics(propertyId, year)
+      const siteEui = metrics.siteEui as number | null
+      const esScore = metrics.energyStarScore as number | null
+
+      const euiPctile = siteEui != null ? euiPercentile(siteEui, assetClass) : null
+      const median = cbecMedian(assetClass)
+
+      return {
+        propertyId,
+        assetClass,
+        year: metrics.year,
+        siteEui,
+        euiPercentile: euiPctile,
+        euiVsMedian: siteEui != null
+          ? { cbecMedian: median, pctDiff: Math.round(((siteEui - median) / median) * 100) }
+          : null,
+        energyStarScore: esScore,
+        energyStarScorePercentile: esScore,
+        scoreEligible: metrics.scoreEligible,
+        dataSource: CBECS_CITATION,
+        note: 'EUI percentile derived from CBECS 2018 national distribution using linear interpolation between published decile/quartile breakpoints.',
+      }
+    }),
+  )
+
+  server.tool(
+    'get_portfolio_benchmarks',
+    `Batch peer-percentile ranking for a portfolio. Returns EUI and ENERGY STAR score percentiles for all properties, ` +
+    `sorted by EUI efficiency percentile descending (best performers first), ` +
+    `plus portfolio-level median, top-quartile, and bottom-quartile EUI. ` +
+    `Handles up to 200 properties. Valid asset classes: ${VALID_ASSET_CLASSES.join(', ')}.`,
+    {
+      propertyIds: z.array(z.number().int().positive()).min(1).max(200)
+        .describe('List of ESPM property IDs'),
+      assetClass: z.enum(VALID_ASSET_CLASSES as [AssetClass, ...AssetClass[]])
+        .describe('Asset class applied to all properties in the batch'),
+      year: z.number().int().min(2000).max(2035).optional()
+        .describe('Metrics year. Defaults to current calendar year.'),
+    },
+    ({ propertyIds, assetClass, year }) => wrap(async () => {
+      // Fetch all properties in parallel (ESPM rate-limits at ~10 concurrent; use batches of 10)
+      const BATCH = 10
+      const results: Array<{ propertyId: number; siteEui: number | null; energyStarScore: number | null; euiPercentile: number | null; error?: string }> = []
+
+      for (let i = 0; i < propertyIds.length; i += BATCH) {
+        const batch = propertyIds.slice(i, i + BATCH)
+        const settled = await Promise.allSettled(
+          batch.map(async (id) => {
+            const metrics = await client.getMetrics(id, year)
+            const siteEui = metrics.siteEui as number | null
+            return {
+              propertyId: id,
+              siteEui,
+              energyStarScore: metrics.energyStarScore as number | null,
+              euiPercentile: siteEui != null ? euiPercentile(siteEui, assetClass) : null,
+            }
+          }),
+        )
+        for (let j = 0; j < batch.length; j++) {
+          const s = settled[j]
+          if (s.status === 'fulfilled') {
+            results.push(s.value)
+          } else {
+            results.push({ propertyId: batch[j], siteEui: null, energyStarScore: null, euiPercentile: null, error: String(s.reason) })
+          }
+        }
+      }
+
+      // Sort by euiPercentile descending (best first), nulls last
+      results.sort((a, b) => {
+        if (a.euiPercentile == null && b.euiPercentile == null) return 0
+        if (a.euiPercentile == null) return 1
+        if (b.euiPercentile == null) return -1
+        return b.euiPercentile - a.euiPercentile
+      })
+
+      // Compute portfolio statistics from non-null EUI values
+      const validEuis = results.map(r => r.siteEui).filter((v): v is number => v != null).sort((a, b) => a - b)
+      const median = cbecMedian(assetClass)
+
+      const portfolioMedianEui = validEuis.length > 0
+        ? validEuis[Math.floor(validEuis.length / 2)]
+        : null
+      const topQuartileEui = validEuis.length > 0
+        ? validEuis[Math.floor(validEuis.length * 0.25)]
+        : null
+      const bottomQuartileEui = validEuis.length > 0
+        ? validEuis[Math.floor(validEuis.length * 0.75)]
+        : null
+
+      return {
+        assetClass,
+        year: year ?? new Date().getFullYear(),
+        totalProperties: propertyIds.length,
+        successCount: results.filter(r => r.siteEui != null).length,
+        properties: results,
+        portfolioSummary: {
+          medianSiteEui: portfolioMedianEui,
+          topQuartileSiteEui: topQuartileEui,
+          bottomQuartileSiteEui: bottomQuartileEui,
+          cbecNationalMedian: median,
+          portfolioVsNationalMedianPct: portfolioMedianEui != null
+            ? Math.round(((portfolioMedianEui - median) / median) * 100)
+            : null,
+        },
+        dataSource: CBECS_CITATION,
+      }
+    }),
   )
 }
